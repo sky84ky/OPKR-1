@@ -24,7 +24,7 @@ class DRIVER_MONITOR_SETTINGS():
     self._AWARENESS_PROMPT_TIME_TILL_TERMINAL = 6.
     # optech 화면 '운전자 모니터링: 기본 사용': looking away for 1 minute gives the first warning (pre: 60 s, prompt with
     # sound: 62 s, red + decel: 68 s). Was 30000 s here (practically never); stock comma is 11 s
-    self._DISTRACTED_TIME = 60. + 8. # active monitoring total timeout
+    self._DISTRACTED_TIME = 30000. # active monitoring total timeout
     self._DISTRACTED_PRE_TIME_TILL_TERMINAL = 8.
     self._DISTRACTED_PROMPT_TIME_TILL_TERMINAL = 6.
 
