@@ -19,6 +19,7 @@ from cereal import log
 from selfdrive.road_speed_limiter import road_speed_limiter_get_max_speed, road_speed_limiter_get_active, \
   get_road_speed_limiter
 from selfdrive.carrot.curve_speed import VisionCurveSpeed, NO_LIMIT_KPH, curve_speed as carrot_curve_speed
+from selfdrive.carrot.tools.drivelog import diag_write
 import time
 #import common.loger as trace1
 
@@ -55,6 +56,25 @@ V_CURVE_LOOKUP_BP = [0., 1./800., 1./670., 1./560., 1./440., 1./360., 1./265., 1
 V_CRUVE_LOOKUP_VALS = [300, 150, 120, 110, 100, 90, 80, 70, 60, 50, 45, 35, 30]
 
 
+def engage_long_user(CP, CS):
+  """Speed control state (longActiveUser) at the moment openpilot engages, by carrot's cruise button rule
+  (2026-11-27): the cruise button turns steering on, SET/RES turn speed control on.
+  openpilot long: engaging comes only from SET/RES (buttonEnable) -> steering + speed control.
+  stock SCC: engaged by the cruise button (standby on, the car's SCC still off) -> steering only; engaged because the
+  car's SCC came on (the driver's SET/RES with the standby on) -> steering + speed control."""
+  if CP.openpilotLongitudinalControl:
+    return 1
+  return 1 if CS.cruiseState.enabled else 0
+
+
+def button_resume_speed(button, v_ego_kph_set, v_cruise_kph_backup):
+  """Set speed when SET/RES bring paused speed control back (openpilot long): SET the current speed, RES the set speed
+  from before the pause (the current speed if there is none), like the stock car and carrot."""
+  if button == ButtonType.decelCruise or v_cruise_kph_backup <= 0:
+    return v_ego_kph_set
+  return v_cruise_kph_backup
+
+
 class CruiseHelper:
 
   def __init__(self):
@@ -63,6 +83,8 @@ class CruiseHelper:
     self.v_cruise_kph_backup = 20
     self.curve_speed_last = 255
     self.longActiveUser = 0
+    self.car_scc_prev = False    # the car's SCC on last frame (stock SCC: stock_scc_follow)
+    self.stock_sync_frames = 0   # stock SCC: frames left to take the car's set speed after it came on
     self.preBrakePressed = False
     self.preGasPressedMax = 0.0
     self.gasPressedCount = 0
@@ -165,7 +187,6 @@ class CruiseHelper:
     self.cruiseOnDist = float(int(Params().get("CruiseOnDist", encoding="utf8"))) / 100.
     self.steerRatioApply = float(int(Params().get("SteerRatioApply", encoding="utf8"))) / 10.
     self.lateralTorqueCustom = int(Params().get("LateralTorqueCustom", encoding="utf8") or 0) > 0
-    self.engageWithLong = Params().get_bool("EngageWithLong")
     self.auto_cruise_control = True
 
   def update_params(self, frame):
@@ -175,7 +196,6 @@ class CruiseHelper:
 
       if self.update_params_count == 0:
         self.autoCurveSpeedCtrlUse = int(Params().get("AutoCurveSpeedCtrlUse"))
-        self.engageWithLong = Params().get_bool("EngageWithLong")
         self.autoCurveSpeedFactor = float(int(Params().get("AutoCurveSpeedFactor", encoding="utf8")))*0.01
         self.autoCurveSpeedFactorIn = float(int(Params().get("AutoCurveSpeedFactorIn", encoding="utf8")))*0.01
       elif self.update_params_count == 1:
@@ -734,6 +754,23 @@ class CruiseHelper:
     button,buttonLong,buttonSpeed = self.update_cruise_buttons(enabled, controls,CS,  buttonEvents, v_cruise_kph, metric)
     longActiveUser = self.longActiveUser
 
+    # carrot's cruise button rule (2026-11-27, Soul EV tester: after CANCEL, SET/RES did nothing): with steering on and
+    # speed control paused (a short CANCEL, the brake, '브레이크 후 다시 켜기: 다시 켜지 않음'), SET/RES bring speed
+    # control back on openpilot-long cars - SET at the current speed, RES at the set speed from before the pause. On
+    # stock-SCC cars the car's own SCC takes SET/RES and stock_scc_follow() turns speed control on when it comes on.
+    if self.longActiveUser <= 0 and controls.CP.openpilotLongitudinalControl and \
+       button in [ButtonType.accelCruise, ButtonType.decelCruise]:
+      if not buttonLong:
+        self.cruiseButtons = button
+      if button == ButtonType.accelCruise:
+        controls.cruiseButtonCounter += 1
+      else:
+        controls.cruiseButtonCounter -= 1
+      v_cruise_kph = button_resume_speed(button, self.v_ego_kph_set, self.v_cruise_kph_backup)
+      diag_write(f"cruise: {'RES' if button == ButtonType.accelCruise else 'SET'}{' held' if buttonLong else ''} -> "
+                 f"speed control on again at {v_cruise_kph:.0f} km/h ({self.v_ego_kph} km/h now)")
+      return 1, v_cruise_kph
+
     ##### Cruise Button 처리...
     if buttonLong:
       if button in [ButtonType.accelCruise, ButtonType.decelCruise]:
@@ -742,9 +779,9 @@ class CruiseHelper:
         pass  # driving mode is fixed to 일반; long-pressing the gap button no longer cycles modes
     else:
       self.cruiseButtons = button
-      # C2 port: +/- only change the set speed while speed control is on; they never turn it on or off
-      # (speed control starts with the cruise button, see controlsd EngageWithLong)
-      if button == ButtonType.accelCruise:   
+      # C2 port: while speed control is on, +/- only change the set speed (they never turn it off); bringing paused
+      # speed control back is handled above
+      if button == ButtonType.accelCruise:
         controls.cruiseButtonCounter += 1
         if self.longActiveUser <= 0:
           pass
@@ -775,6 +812,24 @@ class CruiseHelper:
           else:
             v_cruise_kph = buttonSpeed  # C2 port: CruiseButtonMode 2 pause - removed (buttons never turn speed control off)
 
+    return longActiveUser, v_cruise_kph
+
+  def stock_scc_follow(self, controls, CS, longActiveUser, v_cruise_kph, brakePressed, car_scc_rising):
+    """carrot's cruise button rule on stock-SCC cars (pcmCruise): the cruise button gave steering only (or a short
+    CANCEL paused speed control), and the driver's SET/RES turn the car's own SCC on -> openpilot's speed control
+    (set speed through the buttons, curve / camera slow-down, RES after the brake) comes on with it. For about 0.5 s
+    the set speed follows the car's, so openpilot does not press the buttons toward an old value."""
+    if not controls.CP.pcmCruise:
+      return longActiveUser, v_cruise_kph
+    if car_scc_rising and longActiveUser <= 0 and not brakePressed:
+      longActiveUser = 1
+      self.stock_sync_frames = int(0.5 / DT_CTRL)
+      diag_write(f"cruise: car SCC on -> speed control on (stock SCC, car set "
+                 f"{CS.cruiseState.speed * CV.MS_TO_KPH:.0f} km/h, {self.v_ego_kph} km/h now)")
+    if self.stock_sync_frames > 0:
+      self.stock_sync_frames -= 1
+      car_set = CS.cruiseState.speed * CV.MS_TO_KPH
+      v_cruise_kph = car_set if car_set >= self.cruiseSpeedMin else self.v_ego_kph_set
     return longActiveUser, v_cruise_kph
 
   def cruise_control_speed(self, controls, CS, v_cruise_kph):
@@ -912,7 +967,9 @@ class CruiseHelper:
     longActiveUser, v_cruise_kph = self.button_control(enabled, controls, CS, v_cruise_kph, buttonEvents, metric)
 
     v_cruise_kph, longActiveUser = self.update_apilot_cmd(controls, v_cruise_kph, longActiveUser)
-    if controls.enabled:      
+    car_scc_rising = CS.cruiseState.enabled and not self.car_scc_prev
+    self.car_scc_prev = CS.cruiseState.enabled
+    if controls.enabled:
 
       if brakePressed and not self.preBrakePressed:
         if self.longActiveUser > 0:
@@ -945,22 +1002,26 @@ class CruiseHelper:
           if self.cruiseOnDist > 0.0:
             longActiveUser = 3
 
+      # carrot's cruise button rule, stock SCC: the car's own SCC coming on (the driver's SET/RES) turns speed control on
+      longActiveUser, v_cruise_kph = self.stock_scc_follow(controls, CS, longActiveUser, v_cruise_kph, brakePressed,
+                                                           car_scc_rising)
+
       # optech '악셀로 다시 켜기' (driver feedback: brake, then straight onto the gas left the SCC off): speed control
       # paused by the brake comes back while the driver is on the gas - held 0.5 s, 30 km/h or more, wheel near straight,
       # not at a red light - at the current speed. While the gas stays down, '가속페달 속도 맞춤 상한' (check_gas_cruise_on)
       # then raises the set speed with the car. A cancel press clears brake_paused: no gas resume after the driver's own off
-      if self.engageWithLong and self.optechGasResume and self.brake_paused and longActiveUser <= 0 and CS.gasPressed \
+      if self.optechGasResume and self.brake_paused and longActiveUser <= 0 and CS.gasPressed \
          and not brakePressed and self.gasPressedCount * DT_CTRL >= 0.5 and self.v_ego_kph >= 30 \
          and abs(CS.steeringAngleDeg) < 20 and (self.trafficState % 10) != 1:
         longActiveUser = 3
         v_cruise_kph = self.v_ego_kph_set
 
-      # C2 port ('사용 방식' 조향+가감속): speed control paused by the brake comes back, at the set speed from before
+      # C2 port: speed control paused by the brake comes back, at the set speed from before
       # braking, as soon as the brake is off: right away when moving (>= 10 km/h) or behind a lead within 10 m; from a
       # stop without a lead, once the driver has driven off past 10 km/h and is off the gas (no launch from a stop)
       # optech '브레이크 후 다시 켜기': 1 (default) keeps the speed the driver braked down to (from 30 km/h; slower, e.g.
       # creeping behind a lead, the set speed from before braking), 0 the set speed from before braking, 2 never (RES / + button)
-      if self.engageWithLong and self.brake_paused and longActiveUser <= 0 and not brakePressed and not CS.gasPressed \
+      if self.brake_paused and longActiveUser <= 0 and not brakePressed and not CS.gasPressed \
          and self.optechBrakeResumeMode != 2:
         if self.v_ego_kph >= 10 or 0 < self.dRel < 10:
           longActiveUser = 3
@@ -972,9 +1033,6 @@ class CruiseHelper:
       if longActiveUser > 0:
         self.brake_paused = False
 
-      # C2 port: steering only (시작 탭 '사용 방식' 조향만) -> speed control never starts
-      if not self.engageWithLong:
-        longActiveUser = min(longActiveUser, 0)
       self.cruise_control(controls, CS, longActiveUser, v_cruise_kph)
 
 

@@ -272,6 +272,7 @@ class LongitudinalMpc:
     self.x_obstacle_min = 0.0
     self.openpilotLongitudinalControl = False
     self.experimentalMode = False
+    self.autoE2EMode = None  # optech '자동 E2E / ACC 전환': 'acc' / 'blended' from LongitudinalPlanner, None = off
     self.cutout_relief_enabled = False  # set every plan by LongitudinalPlanner (CarrotCutOutRelief)
 
   def reset(self):
@@ -442,7 +443,15 @@ class LongitudinalMpc:
     self.params[:,1] = self.max_a if not reset_state else a_ego
 
     v_cruise, stop_x, self.mode = self.update_apilot(controls, carstate, radarstate, model, v_cruise, self.mode)
-    self.mode = 'blended' if self.experimentalMode else self.mode
+    # optech: '자동 E2E / ACC 전환' (spst dynamic e2e) decides first, then 실험 모드 (always blended). apilot's own
+    # switching above only runs with TrafficStopMode > 0, which manager.py pins to 0: with both switches off it is
+    # 'acc' again (before, turning 실험 모드 off while driving left the mode on 'blended' until a restart)
+    if self.autoE2EMode is not None:
+      self.mode = self.autoE2EMode
+    elif self.experimentalMode:
+      self.mode = 'blended'
+    elif self.trafficStopMode == 0:
+      self.mode = 'acc'
     self.set_weights(prev_accel_constraint=prev_accel_constraint, v_lead0=lead_xv_0[0,1], v_lead1=lead_xv_1[0,1])
 
     # Update in ACC mode or ACC/e2e blend

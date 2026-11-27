@@ -746,7 +746,10 @@ void UIState::update() {
     // so with the car off the values were never read
     Params params;
     settings_timeout_s = std::atoi(params.get("OptechSettingsTimeout").c_str());
-    drive_dim = std::atoi(params.get("OptechDriveDim").c_str());
+    // optech 2026-11-27: a read that comes back empty keeps the last value ('주행 중 밝기' must not flip to 항상 밝음
+    // for a second and light the screen up)
+    const std::string dim = params.get("OptechDriveDim");
+    if (!dim.empty()) drive_dim = std::atoi(dim.c_str());
     show_record_btn = params.getBool("OptechShowRecordBtn");
     show_gps_speed = params.getBool("OptechShowGpsSpeed");
     radar_tracks = params.getBool("EnableRadarTracks");
@@ -829,8 +832,15 @@ void Device::updateBrightness(const UIState &s) {
                    gear != cereal::CarState::GearShifter::NEUTRAL;
     if (!driving_gear) idle_frames = 0;
   }
+  // only a warning that is drawn on the screen brings the brightness back (Soul EV tester 2026-11-27: 0.5 s flashes with
+  // the screen at 0 %). Some prompts have no box at all (AlertSize NONE, e.g. '옆 차로에 차량 또는 도로 끝'): their
+  // status still turns the screen to "warning", but there is nothing to read
+  bool visible_alert = false;
+  if (s.status == STATUS_WARNING || s.status == STATUS_ALERT) {
+    visible_alert = (*s.sm)["controlsState"].getControlsState().getAlertSize() != cereal::ControlsState::AlertSize::NONE;
+  }
   const bool want_dim = s.scene.started && s.drive_dim != 0 && driving_gear && idle_frames >= 30 * UI_FREQ &&
-                        s.status != STATUS_WARNING && s.status != STATUS_ALERT;
+                        !visible_alert;
   if (want_dim) {
     clipped_brightness = s.drive_dim < 0 ? 0.f : std::min(clipped_brightness, (float)s.drive_dim);
     if (s.drive_dim < 0) brightness_filter.reset(0.f);  // '화면 밝기 0%': off at once, not a 40 s fade

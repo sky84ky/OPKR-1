@@ -17,6 +17,8 @@ from common.params import Params
 from selfdrive.controls.lib.turn_accel import get_future_curvature, limit_accel_in_turns as carrot_limit_accel_in_turns
 from selfdrive.controls.lib.cutin_predecel import apply_cutin_predecel_accel_limit, get_cutin_predecel_accel_limit
 from selfdrive.controls.lib.longitudinal_stopping_lead import StoppingLeadFilter
+from selfdrive.controls.lib.dynamic_endtoend_controller import DynamicEndtoEndController
+from selfdrive.carrot.tools.drivelog import diag_write
 
 LON_MPC_STEP = 0.2  # first step is 0.2s
 CARROT_TURN_A_LAT_MAX = 3.0  # carrot-wip planner value; limited further by its 0.70 safety ratio
@@ -83,6 +85,10 @@ class LongitudinalPlanner:
 
     self.mpc.openpilotLongitudinalControl = CP.openpilotLongitudinalControl
     self.stopping_lead_filter = StoppingLeadFilter()
+    # optech '자동 E2E / ACC 전환' (OptechAutoE2E, spst dp_long_de2e): openpilot long only
+    self.dynamic_endtoend_controller = DynamicEndtoEndController()
+    self.auto_e2e_prev = None
+    self.auto_e2e_log_frame = -1000
 
   def read_param(self):
     #try:
@@ -102,6 +108,33 @@ class LongitudinalPlanner:
     self.carrotCutInPredecel = self.read_int_param("CarrotCutInPredecel", 0)
     self.carrotCutOutRelief = self.read_int_param("CarrotCutOutRelief", 0)
     self.carrotStoppingLead = self.read_int_param("CarrotStoppingLead", 0)
+    self.optechAutoE2E = self.read_int_param("OptechAutoE2E", 0) == 1
+
+  def update_auto_e2e(self, sm):
+    """optech '자동 E2E / ACC 전환' (spst / dragonpilot dynamic e2e): with openpilot long, choose 'acc' (follow the
+    radar lead) or 'blended' (the driving model's stop / slow-down, e.g. a red light with no car ahead) every plan.
+    The MPC uses it before 실험 모드 (long_mpc.update); set here first so this plan's accel limits match it."""
+    if not (self.optechAutoE2E and self.CP.openpilotLongitudinalControl):
+      self.dynamic_endtoend_controller.set_enabled(False)
+      self.mpc.autoE2EMode = None
+      self.auto_e2e_prev = None
+      return
+    dec = self.dynamic_endtoend_controller
+    dec.set_enabled(True)
+    dec.set_mpc_fcw_crash_cnt(self.mpc.crash_cnt)
+    mode = dec.get_mpc_mode(self.CP.radarUnavailable, sm['carState'], sm['radarState'].leadOne, sm['modelV2'],
+                            sm['controlsState'])
+    self.mpc.autoE2EMode = mode
+    self.mpc.mode = mode
+    if mode != self.auto_e2e_prev:
+      # diag.txt: why it switched (at most every 2 s; the 'blended' hold keeps it from flapping faster anyway)
+      if self.auto_e2e_prev is not None and self.param_read_counter - self.auto_e2e_log_frame >= 40:
+        self.auto_e2e_log_frame = self.param_read_counter
+        diag_write(f"auto e2e: {self.auto_e2e_prev} -> {mode} (lead {int(dec._has_lead_filtered)} slow_down "
+                   f"{int(dec._has_slow_down)} standstill {int(dec._has_standstill)} blinker {int(dec._has_blinkers)} "
+                   f"slowness {int(dec._has_slowness)} fcw {int(dec._has_mpc_fcw)} ttc {int(dec._has_dangerous_ttc)}, "
+                   f"{dec._v_ego_kph:.0f} km/h)")
+      self.auto_e2e_prev = mode
 
   @staticmethod
   def service_ok(sm, name):
@@ -150,6 +183,7 @@ class LongitudinalPlanner:
     self.param_read_counter += 1
     #self.mpc.mode = 'blended' if sm['controlsState'].experimentalMode else 'acc'
     self.mpc.experimentalMode = sm['controlsState'].experimentalMode
+    self.update_auto_e2e(sm)
 
     v_ego = sm['carState'].vEgo
     v_cruise_kph = sm['controlsState'].vCruise

@@ -515,6 +515,14 @@ class CarInterface(CarInterfaceBase):
     allow_enable = any(btn in ENABLE_BUTTONS for btn in self.CS.cruise_buttons) or any(self.CS.main_buttons)
     events = self.create_common_events(ret, pcm_enable=self.CS.CP.pcmCruise, allow_enable=allow_enable)
 
+    # carrot's cruise button rule (2026-11-27), stock SCC: with the cruise standby on and openpilot off (CANCEL held, or
+    # a standby that comes on by itself at start), the driver's SET/RES turn the car's SCC on -> openpilot engages too,
+    # with speed control (controlsd engage_long_user). It used to cancel the car's SCC at once. Openpilot long cars
+    # engage on the SET/RES release (buttonEnable) as before.
+    if self.CS.CP.pcmCruise and ret.cruiseState.enabled and not self.CS.out.cruiseState.enabled and allow_enable \
+       and not c.enabled:
+      events.add(car.CarEvent.EventName.pcmEnable)
+
     # C2 port (one-button use): the cruise main button (CF_Clu_CruiseSwMain) pressed while openpilot is engaged
     # disengages steering and speed control together. Engaging is unchanged (the SCC turning on gives pcmEnable;
     # controlsd then starts speed control at once). The II/cancel button keeps its apilot behavior.

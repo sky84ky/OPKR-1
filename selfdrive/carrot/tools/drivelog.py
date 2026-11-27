@@ -129,6 +129,10 @@ class DriveLog:
     self.prev_panda = None
     self.prev_panda_errs = None
     self.next_panda_err_event = 0.
+    # '주행 중 밝기' (screen_events)
+    self.drive_dim = 0
+    self.next_dim_read = 0.
+    self.prev_screen = None
 
   def context(self, cs, cc, ctl):
     """Short state for an event line: what the driver and openpilot were doing at that moment."""
@@ -269,6 +273,7 @@ class DriveLog:
       if alert and alert != self.prev_alert:
         self.event(f"alert: {alert}")
       self.prev_alert = alert
+      self.screen_events(ctl, now)
 
     ms = self.last.get("managerState")
     if ms is not None:
@@ -362,6 +367,31 @@ class DriveLog:
     parts.append(("R" if rs.leadOne.radar else "V") if rs is not None and rs.leadOne.status else "-")
     self.out.write(" | ".join(parts) + "\n")
     self.cpu_top(now)
+
+  def screen_events(self, ctl, now):
+    """'주행 중 밝기' (OptechDriveDim, ui.cc Device::updateBrightness) set: which warning brings a dimmed screen back.
+    Only a warning drawn on the screen does (status not normal, size not none); a prompt without a box only changes
+    the status (Soul EV tester 2026-11-27: 0.5 s flashes at '화면 밝기 0%'). Touches are not visible here."""
+    if now >= self.next_dim_read:
+      self.next_dim_read = now + 10.
+      try:
+        from common.params import Params
+        self.drive_dim = int(Params().get("OptechDriveDim", encoding="utf8") or 0)
+      except Exception:  # noqa: BLE001
+        self.drive_dim = 0
+    reason = None
+    if self.drive_dim != 0 and str(ctl.alertStatus) != "normal":
+      text = f"{ctl.alertText1} {ctl.alertText2}".strip()
+      if str(ctl.alertSize) != "none":
+        reason = f"screen bright: {ctl.alertStatus} warning '{text}'"
+      else:
+        reason = f"screen stays dark: {ctl.alertStatus} prompt without a box '{text}'"
+    if reason != self.prev_screen:
+      if reason is not None:
+        self.event(reason)
+      elif self.prev_screen.startswith("screen bright"):
+        self.event("screen: warning over, dimming rules again")
+      self.prev_screen = reason
 
   def panda_events(self):
     """Panda safety mode / controls allowed / faults / harness changes right away (the switch to the car's safety mode
