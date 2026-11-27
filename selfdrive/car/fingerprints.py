@@ -34,7 +34,7 @@ def get_attr_from_cars(attr, result=dict, combine_brands=True):
   return result
 
 
-FW_VERSIONS = get_attr_from_cars('SANTAFE_TM')
+FW_VERSIONS = get_attr_from_cars('FW_VERSIONS')
 _FINGERPRINTS = get_attr_from_cars('FINGERPRINTS')
 
 _DEBUG_ADDRESS = {1880: 8}   # reserved for debug purposes
